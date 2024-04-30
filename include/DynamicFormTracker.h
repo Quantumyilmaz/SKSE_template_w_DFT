@@ -1,4 +1,392 @@
-#include "Utils.h"
+#include "RE/Skyrim.h"
+#include "SKSE/SKSE.h"
+#include <spdlog/sinks/basic_file_sink.h>
+
+namespace logger = SKSE::log;
+using namespace std::literals;
+
+using FormID = RE::FormID;
+
+// Serialization
+
+
+struct DFSaveData {
+    FormID dyn_formid = 0;
+    std::pair<bool, uint32_t> custom_id = {false, 0};
+    float acteff_elapsed = -1.f;
+};
+using DFSaveDataLHS = std::pair<FormID, std::string>;
+using DFSaveDataRHS = std::vector<DFSaveData>;
+
+std::vector<std::pair<int, bool>> encodeString(const std::string& inputString) {
+    std::vector<std::pair<int, bool>> encodedValues;
+    try {
+        for (int i = 0; i < 100 && inputString[i] != '\0'; i++) {
+            char ch = inputString[i];
+            if (std::isprint(ch) && (std::isalnum(ch) || std::isspace(ch) || std::ispunct(ch)) && ch >= 0 &&
+                ch <= 255) {
+                encodedValues.push_back(std::make_pair(static_cast<int>(ch), std::isupper(ch)));
+            }
+        }
+    } catch (const std::exception& e) {
+        logger::error("Error encoding string: {}", e.what());
+        return encodeString("ERROR");
+    }
+    return encodedValues;
+}
+
+std::string decodeString(const std::vector<std::pair<int, bool>>& encodedValues) {
+    std::string decodedString;
+    for (const auto& pair : encodedValues) {
+        char ch = static_cast<char>(pair.first);
+        if (std::isalnum(ch) || std::isspace(ch) || std::ispunct(ch)) {
+            if (pair.second) {
+                decodedString += ch;
+            } else {
+                decodedString += static_cast<char>(std::tolower(ch));
+            }
+        }
+    }
+    return decodedString;
+}
+
+bool read_string(SKSE::SerializationInterface* a_intfc, std::string& a_str) {
+    std::vector<std::pair<int, bool>> encodedStr;
+    std::size_t size;
+    if (!a_intfc->ReadRecordData(size)) {
+        return false;
+    }
+    for (std::size_t i = 0; i < size; i++) {
+        std::pair<int, bool> temp_pair;
+        if (!a_intfc->ReadRecordData(temp_pair)) {
+            return false;
+        }
+        encodedStr.push_back(temp_pair);
+    }
+    a_str = decodeString(encodedStr);
+    return true;
+}
+
+bool write_string(SKSE::SerializationInterface* a_intfc, const std::string& a_str) {
+    const auto encodedStr = encodeString(a_str);
+    // i first need the size to know no of iterations
+    const auto size = encodedStr.size();
+    if (!a_intfc->WriteRecordData(size)) {
+        return false;
+    }
+    for (const auto& temp_pair : encodedStr) {
+        if (!a_intfc->WriteRecordData(temp_pair)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// github.com/ozooma10/OSLAroused/blob/29ac62f220fadc63c829f6933e04be429d4f96b0/src/PersistedData.cpp
+template <typename T, typename U>
+// BaseData is based off how powerof3's did it in Afterlife
+class BaseData {
+public:
+    float GetData(T formId, T missing) {
+        Locker locker(m_Lock);
+        if (auto idx = m_Data.find(formId) != m_Data.end()) {
+            return m_Data[formId];
+        }
+        return missing;
+    }
+
+    void SetData(T formId, U value) {
+        Locker locker(m_Lock);
+        m_Data[formId] = value;
+    }
+
+    virtual const char* GetType() = 0;
+
+    virtual bool Save(SKSE::SerializationInterface*, std::uint32_t, std::uint32_t) { return false; };
+    virtual bool Save(SKSE::SerializationInterface*) { return false; };
+    virtual bool Load(SKSE::SerializationInterface*) { return false; };
+
+    void Clear() {
+        Locker locker(m_Lock);
+        m_Data.clear();
+    };
+
+    virtual void DumpToLog() = 0;
+
+protected:
+    std::map<T, U> m_Data;
+
+    using Lock = std::recursive_mutex;
+    using Locker = std::lock_guard<Lock>;
+    mutable Lock m_Lock;
+};
+
+class DFSaveLoadData : public BaseData<Types::DFSaveDataLHS, Types::DFSaveDataRHS> {
+public:
+    void DumpToLog() override {
+        // nothing for now
+    }
+
+    [[nodiscard]] bool Save(SKSE::SerializationInterface* serializationInterface) override {
+        assert(serializationInterface);
+        Locker locker(m_Lock);
+
+        const auto numRecords = m_Data.size();
+        if (!serializationInterface->WriteRecordData(numRecords)) {
+            logger::error("Failed to save {} data records", numRecords);
+            return false;
+        }
+
+        for (const auto& [lhs, rhs] : m_Data) {
+            // we serialize formid, editorid, and refid separately
+            std::uint32_t formid = lhs.first;
+            logger::trace("Formid:{}", formid);
+            if (!serializationInterface->WriteRecordData(formid)) {
+                logger::error("Failed to save formid");
+                return false;
+            }
+
+            const std::string editorid = lhs.second;
+            logger::trace("Editorid:{}", editorid);
+            write_string(serializationInterface, editorid);
+
+            // save the number of rhs records
+            const auto numRhsRecords = rhs.size();
+            if (!serializationInterface->WriteRecordData(numRhsRecords)) {
+                logger::error("Failed to save the size {} of rhs records", numRhsRecords);
+                return false;
+            }
+
+            for (const auto& rhs_ : rhs) {
+                logger::trace("size of rhs_: {}", sizeof(rhs_));
+                if (!serializationInterface->WriteRecordData(rhs_)) {
+                    logger::error("Failed to save data");
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    [[nodiscard]] bool Save(SKSE::SerializationInterface* serializationInterface, std::uint32_t type,
+                            std::uint32_t version) override {
+        if (!serializationInterface->OpenRecord(type, version)) {
+            logger::error("Failed to open record for Data Serialization!");
+            return false;
+        }
+
+        return Save(serializationInterface);
+    }
+
+    [[nodiscard]] bool Load(SKSE::SerializationInterface* serializationInterface) override {
+        assert(serializationInterface);
+
+        std::size_t recordDataSize;
+        serializationInterface->ReadRecordData(recordDataSize);
+        logger::info("Loading data from serialization interface with size: {}", recordDataSize);
+
+        Locker locker(m_Lock);
+        m_Data.clear();
+
+        logger::trace("Loading data from serialization interface.");
+        for (auto i = 0; i < recordDataSize; i++) {
+            Types::DFSaveDataRHS rhs;
+
+            std::uint32_t formid = 0;
+            logger::trace("ReadRecordData:{}", serializationInterface->ReadRecordData(formid));
+            if (!serializationInterface->ResolveFormID(formid, formid)) {
+                logger::error("Failed to resolve form ID, 0x{:X}.", formid);
+                continue;
+            }
+
+            std::string editorid;
+            if (!read_string(serializationInterface, editorid)) {
+                logger::error("Failed to read editorid");
+                return false;
+            }
+
+            logger::trace("Formid:{}", formid);
+            logger::trace("Editorid:{}", editorid);
+
+            Types::DFSaveDataLHS lhs({formid, editorid});
+            logger::trace("Reading value...");
+
+            std::size_t rhsSize = 0;
+            logger::trace("ReadRecordData: {}", serializationInterface->ReadRecordData(rhsSize));
+            logger::trace("rhsSize: {}", rhsSize);
+
+            for (auto j = 0; j < rhsSize; j++) {
+                Types::DFSaveData rhs_;
+                logger::trace("ReadRecordData: {}", serializationInterface->ReadRecordData(rhs_));
+                logger::trace(
+                    "rhs_ content: dyn_formid: {}, customid_bool: {},"
+                    "customid: {}, acteff_elapsed: {}",
+                    rhs_.dyn_formid, rhs_.custom_id.first, rhs_.custom_id.second, rhs_.acteff_elapsed);
+                rhs.push_back(rhs_);
+            }
+
+            m_Data[lhs] = rhs;
+            logger::info("Loaded data for formid {}, editorid {}", formid, editorid);
+        }
+
+        return true;
+    }
+};
+
+
+namespace FunctionsSkyrim {
+
+    RE::TESForm* GetFormByID(const RE::FormID id, const std::string& editor_id = "") {
+        if (!editor_id.empty()) {
+            auto* form = RE::TESForm::LookupByEditorID(editor_id);
+            if (form) return form;
+        }
+        auto form = RE::TESForm::LookupByID(id);
+        if (form) return form;
+        return nullptr;
+    };
+
+    template <class T = RE::TESForm>
+    static T* GetFormByID(const RE::FormID id, const std::string& editor_id = "") {
+        if (!editor_id.empty()) {
+            auto* form = RE::TESForm::LookupByEditorID<T>(editor_id);
+            if (form) return form;
+        }
+        T* form = RE::TESForm::LookupByID<T>(id);
+        if (form) return form;
+        return nullptr;
+    };
+
+    const std::string GetEditorID(const FormID a_formid) {
+        if (const auto form = RE::TESForm::LookupByID(a_formid)) {
+            return clib_util::editorID::get_editorID(form);
+        } else {
+            return "";
+        }
+    }
+
+    // SkyrimThiago <3
+    // https://github.com/Thiago099/DPF-Dynamic-Persistent-Forms
+    namespace DynamicForm {
+
+        const bool IsDynamicFormID(const FormID a_formID) { return a_formID >= 0xFF000000; }
+
+        static void copyBookAppearence(RE::TESForm* source, RE::TESForm* target) {
+            auto* sourceBook = source->As<RE::TESObjectBOOK>();
+
+            auto* targetBook = target->As<RE::TESObjectBOOK>();
+
+            if (sourceBook && targetBook) {
+                targetBook->inventoryModel = sourceBook->inventoryModel;
+            }
+        }
+
+        template <class T>
+        void copyComponent(RE::TESForm* from, RE::TESForm* to) {
+            auto fromT = from->As<T>();
+
+            auto toT = to->As<T>();
+
+            if (fromT && toT) {
+                toT->CopyComponent(fromT);
+            }
+        }
+
+        static void copyFormArmorModel(RE::TESForm* source, RE::TESForm* target) {
+            auto* sourceModelBipedForm = source->As<RE::TESObjectARMO>();
+
+            auto* targeteModelBipedForm = target->As<RE::TESObjectARMO>();
+
+            if (sourceModelBipedForm && targeteModelBipedForm) {
+                logger::info("armor");
+
+                targeteModelBipedForm->armorAddons = sourceModelBipedForm->armorAddons;
+            }
+        }
+
+        static void copyFormObjectWeaponModel(RE::TESForm* source, RE::TESForm* target) {
+            auto* sourceModelWeapon = source->As<RE::TESObjectWEAP>();
+
+            auto* targeteModelWeapon = target->As<RE::TESObjectWEAP>();
+
+            if (sourceModelWeapon && targeteModelWeapon) {
+                logger::info("weapon");
+
+                targeteModelWeapon->firstPersonModelObject = sourceModelWeapon->firstPersonModelObject;
+
+                targeteModelWeapon->attackSound = sourceModelWeapon->attackSound;
+
+                targeteModelWeapon->attackSound2D = sourceModelWeapon->attackSound2D;
+
+                targeteModelWeapon->attackSound = sourceModelWeapon->attackSound;
+
+                targeteModelWeapon->attackFailSound = sourceModelWeapon->attackFailSound;
+
+                targeteModelWeapon->idleSound = sourceModelWeapon->idleSound;
+
+                targeteModelWeapon->equipSound = sourceModelWeapon->equipSound;
+
+                targeteModelWeapon->unequipSound = sourceModelWeapon->unequipSound;
+
+                targeteModelWeapon->soundLevel = sourceModelWeapon->soundLevel;
+            }
+        }
+
+        static void copyMagicEffect(RE::TESForm* source, RE::TESForm* target) {
+            auto* sourceEffect = source->As<RE::EffectSetting>();
+
+            auto* targetEffect = target->As<RE::EffectSetting>();
+
+            if (sourceEffect && targetEffect) {
+                targetEffect->effectSounds = sourceEffect->effectSounds;
+
+                targetEffect->data.castingArt = sourceEffect->data.castingArt;
+
+                targetEffect->data.light = sourceEffect->data.light;
+
+                targetEffect->data.hitEffectArt = sourceEffect->data.hitEffectArt;
+
+                targetEffect->data.effectShader = sourceEffect->data.effectShader;
+
+                targetEffect->data.hitVisuals = sourceEffect->data.hitVisuals;
+
+                targetEffect->data.enchantShader = sourceEffect->data.enchantShader;
+
+                targetEffect->data.enchantEffectArt = sourceEffect->data.enchantEffectArt;
+
+                targetEffect->data.enchantVisuals = sourceEffect->data.enchantVisuals;
+
+                targetEffect->data.projectileBase = sourceEffect->data.projectileBase;
+
+                targetEffect->data.explosion = sourceEffect->data.explosion;
+
+                targetEffect->data.impactDataSet = sourceEffect->data.impactDataSet;
+
+                targetEffect->data.imageSpaceMod = sourceEffect->data.imageSpaceMod;
+            }
+        }
+
+        void copyAppearence(RE::TESForm* source, RE::TESForm* target) {
+            copyFormArmorModel(source, target);
+
+            copyFormObjectWeaponModel(source, target);
+
+            copyMagicEffect(source, target);
+
+            copyBookAppearence(source, target);
+
+            copyComponent<RE::BGSPickupPutdownSounds>(source, target);
+
+            copyComponent<RE::BGSMenuDisplayObject>(source, target);
+
+            copyComponent<RE::TESModel>(source, target);
+
+            copyComponent<RE::TESBipedModelForm>(source, target);
+        }
+
+    };
+
+};
 
 struct ActEff {
     FormID baseFormid;
@@ -8,7 +396,7 @@ struct ActEff {
 
 };
 
-class DynamicFormTracker : public Utilities::DFSaveLoadData {
+class DynamicFormTracker : public DFSaveLoadData {
     
     // created form bank during the session. Create populates this.
     std::map<std::pair<FormID, std::string>, std::set<FormID>> forms;
@@ -29,7 +417,7 @@ class DynamicFormTracker : public Utilities::DFSaveLoadData {
         for (auto it = forms.begin(); it != forms.end(); ++it) {
             auto& [base, formset] = *it;
             for (auto it2 = formset.begin(); it2 != formset.end();) {
-                if (!Utilities::FunctionsSkyrim::GetFormByID(*it2)) {
+                if (!FunctionsSkyrim::GetFormByID(*it2)) {
                     logger::trace("Form with ID {:x} does not exist. Removing from formset.", *it2);
                     it2 = formset.erase(it2);
                     customIDforms.erase(*it2);
@@ -63,14 +451,14 @@ class DynamicFormTracker : public Utilities::DFSaveLoadData {
     [[maybe_unused]] RE::TESForm* GetOGFormOfDynamic(const FormID dynamic_formid) {
 		for (const auto& [base_pair, dyn_formset] : forms) {
 			if (dyn_formset.contains(dynamic_formid)) {
-				return Utilities::FunctionsSkyrim::GetFormByID(base_pair.first, base_pair.second);
+				return FunctionsSkyrim::GetFormByID(base_pair.first, base_pair.second);
 			}
 		}
 		return nullptr;
 	}
 
     void ReviveDynamicForm(RE::TESForm* fake, RE::TESForm* base, const FormID setFormID) {
-        using namespace Utilities::FunctionsSkyrim::DynamicForm;
+        using namespace FunctionsSkyrim::DynamicForm;
         fake->Copy(base);
         auto weaponBaseForm = base->As<RE::TESObjectWEAP>();
 
@@ -404,7 +792,7 @@ public:
 		}
         for (const auto& act_eff : act_effs) {
             const auto base_formid = act_eff.baseFormid;
-            const auto base_form = Utilities::FunctionsSkyrim::GetFormByID(base_formid);
+            const auto base_form = FunctionsSkyrim::GetFormByID(base_formid);
             if (!base_form) {
 				logger::error("Failed to get base form.");
 				continue;
@@ -426,7 +814,7 @@ public:
     // tries to fetch by custom id. regardless, returns formid if there is in the bank
     const FormID Fetch(const FormID baseFormID, const std::string baseEditorID,
                              const std::optional<uint32_t> customID) {
-        auto* base_form = Utilities::FunctionsSkyrim::GetFormByID(baseFormID, baseEditorID);
+        auto* base_form = FunctionsSkyrim::GetFormByID(baseFormID, baseEditorID);
 
         if (!base_form) {
             logger::error("Failed to get base form.");
@@ -451,7 +839,7 @@ public:
     const FormID FetchCreate(const FormID baseFormID, const std::string baseEditorID, const std::optional<uint32_t> customID) {
 
         // TODO merge with Fetch
-        auto* base_form = Utilities::FunctionsSkyrim::GetFormByID<T>(baseFormID, baseEditorID);
+        auto* base_form = FunctionsSkyrim::GetFormByID<T>(baseFormID, baseEditorID);
         
         if (!base_form) {
 			logger::error("Failed to get base form.");
@@ -466,7 +854,7 @@ public:
 		    for (const auto _formid : formset) {
                 if (IsActive(_formid)) continue;
                 if (const auto dyn_form = _yield(_formid, base_form)) return dyn_form->GetFormID();
-                //else if (!Utilities::FunctionsSkyrim::GetFormByID(_formid)) Delete({baseFormID, baseEditorID}, _formid);
+                //else if (!FunctionsSkyrim::GetFormByID(_formid)) Delete({baseFormID, baseEditorID}, _formid);
 		    }
         }
 
@@ -482,7 +870,7 @@ public:
 
     [[maybe_unused]] void ReviveAll() {
         for (const auto& [base, formset] : forms) {
-            auto* base_form = Utilities::FunctionsSkyrim::GetFormByID(base.first, base.second);
+            auto* base_form = FunctionsSkyrim::GetFormByID(base.first, base.second);
             if (!base_form) {
                 logger::error("Failed to get base form.");
                 continue;
@@ -497,7 +885,7 @@ public:
 
     const std::set<FormID> GetFormSet(const FormID base_formid, std::string base_editorid = "") {
         if (base_editorid.empty()) {
-            base_editorid = Utilities::FunctionsSkyrim::GetEditorID(base_formid);
+            base_editorid = FunctionsSkyrim::GetEditorID(base_formid);
             if (base_editorid.empty()) {
                 return {};
             }
@@ -540,14 +928,14 @@ public:
 
         int n_fakes = 0;
         for (const auto& [base_pair, dyn_formset] : forms) {
-            Utilities::Types::DFSaveDataLHS lhs({base_pair.first, base_pair.second});
-            Utilities::Types::DFSaveDataRHS rhs;
+            DFSaveDataLHS lhs({base_pair.first, base_pair.second});
+            DFSaveDataRHS rhs;
 			for (const auto dyn_formid : dyn_formset) {
                 if (!IsActive(dyn_formid)) logger::critical("Inactive form {:x} found in forms set.",dyn_formid);
                 const bool has_customid = customIDforms.contains(dyn_formid);
                 const uint32_t customid = has_customid ? customIDforms[dyn_formid] : 0;
                 const float act_eff_elpsd = GetActiveEffectElapsed(dyn_formid);
-                Utilities::Types::DFSaveData saveData({dyn_formid, {has_customid, customid}, act_eff_elpsd});
+                DFSaveData saveData({dyn_formid, {has_customid, customid}, act_eff_elpsd});
                 rhs.push_back(saveData);
                 n_fakes++;
 			}
@@ -568,7 +956,7 @@ public:
         for (const auto& [lhs, rhs] : m_Data) {
             auto base_formid = lhs.first;
             const auto& base_editorid = lhs.second;
-            const auto temp_form = Utilities::FunctionsSkyrim::GetFormByID(0, base_editorid);
+            const auto temp_form = FunctionsSkyrim::GetFormByID(0, base_editorid);
             if (!temp_form) logger::critical("Failed to get base form.");
             else base_formid = temp_form->GetFormID();
             for (const auto& saveData : rhs) {
@@ -633,7 +1021,7 @@ public:
         for (const auto& [base, formset] : forms) {
 			logger::info("---------------------Base formid: {:x}, EditorID: {}---------------------", base.first, base.second);
 			for (const auto _formid : formset) {
-                const auto _form = Utilities::FunctionsSkyrim::GetFormByID(_formid);
+                const auto _form = FunctionsSkyrim::GetFormByID(_formid);
                 const auto _name = _form ? _form->GetName() : "NULL";
                 logger::info("Dynamic formid: {:x} with name: {}", _formid, _name);
 			}
@@ -651,7 +1039,7 @@ public:
 				continue;
 			}
             const auto& [has_cstmid, custom_id] = it->custom_id;
-            const auto base_mg_item = Utilities::FunctionsSkyrim::GetFormByID(it->baseFormid);
+            const auto base_mg_item = FunctionsSkyrim::GetFormByID(it->baseFormid);
             const auto dynamicFormid = it->dynamicFormid;
             if (!base_mg_item) {
 				logger::error("Failed to get base form.");
@@ -723,5 +1111,3 @@ public:
 
     };
 };
-
-DynamicFormTracker* DFT = nullptr;
