@@ -1,4 +1,5 @@
 set(headers ${headers}
+	include/DynamicFormTracker.h
 	include/Utils.h
 	include/PCH.h
 	include/Settings.h

@@ -1,7 +1,13 @@
-
+#include "DynamicFormTracker.h"
 
 void OnMessage(SKSE::MessagingInterface::Message* message) {
     if (message->type == SKSE::MessagingInterface::kDataLoaded) {
+        if (!Utilities::IsPo3Installed()) {
+            logger::error("Po3 is not installed.");
+            Utilities::MsgBoxesNotifs::Windows::Po3ErrMsg();
+            return;
+        }
+        DFT = DynamicFormTracker::GetSingleton();
         // Start
     }
     if (message->type == SKSE::MessagingInterface::kNewGame || message->type == SKSE::MessagingInterface::kPostLoadGame) {
